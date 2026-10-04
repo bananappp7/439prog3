@@ -24,6 +24,9 @@
 
 constexpr static uint64_t LOG_PAGE_SIZE = 12;
 constexpr static uint64_t PAGE_SIZE = 1 << LOG_PAGE_SIZE;
+constexpr static uint64_t STARTING_ADDRESS = 0x00000001;
+
+SpinLock vmm_lock{};
 
 namespace impl {
 
@@ -63,12 +66,31 @@ typedef struct Mapping {
 Mapping *mappings[1 << 12];
 std::size_t mappings_size = 0;
 
-
+int64_t unmap(VPN vpn);
 
 uint64_t VA::check_canonical(uint64_t va) {
   int64_t sa = int64_t(va);
   ASSERT(((sa << 16) >> 16) == sa);
   return va;
+}
+
+void remove_mapping(uint64_t index) {
+    delete mappings[index];
+    for (uint64_t i = index; i < mappings_size; i ++) {
+        mappings[i] = mappings[i + 1];
+    }
+    mappings_size -= 1;
+    mappings[mappings_size] = nullptr;
+}
+
+void insert_mapping(uint64_t index, Mapping *mapping) {
+    ASSERT(mappings_size <= (1 << 12));
+    for (uint64_t i = mappings_size; i > index; i --) {
+        mappings[i] = mappings[i - 1];
+    }
+
+    mappings[index] = mapping;
+    mappings_size += 1;
 }
 
 /*
@@ -78,37 +100,174 @@ uint64_t VA::check_canonical(uint64_t va) {
 sync<void*> VMM::simplified_mmap(std::size_t length, StrongRef<Node> file,
                            uint64_t offset) {
   //MISSING();
-  //VA address_start(0x00000001 << LOG_PAGE_SIZE);
 
-  /*mappings[mappings_size]->start = 0x00000001 << LOG_PAGE_SIZE;  
-  mappings[mappings_size]->length = length;
-  mappings[mappings_size]->file = file;
-  mappings[mappings_size]->offset = offset;*/
+  vmm_lock.lock();
 
-  mappings[mappings_size] = new Mapping{0x00000001 << LOG_PAGE_SIZE, length, file, offset};
-  mappings_size += 1;
-
-  VA va = VA(0x00000001 << LOG_PAGE_SIZE);
-  VPN vpn = VPN(va);
-
-  PPN ppn = physMem.alloc();
-
-  VA frame_va(ppn);
-  char *buffer = (char *) frame_va;
-
-  if (file == StrongRef<Node>{}) {
-    for (uint64_t i = 0; i < PAGE_SIZE; i++) {
-        buffer[i] = 0;
-    }
+  uint64_t allocated_page_address = STARTING_ADDRESS;
+  uint64_t allocate_page_length = length/PAGE_SIZE;
+  uint64_t ind = mappings_size;
+  if (length & 0xFFF) {
+    allocate_page_length += 1;
   }
 
-  impl::map(vpn, ppn, false, false);
+  //uint64_t mapped_length = (length + PAGE_SIZE - 1) / PAGE_SIZE;
 
-  co_return (void*)(0x00000001 << LOG_PAGE_SIZE);
+  for (uint64_t i = 0; i < mappings_size; i++) {
+    if (mappings[i] == nullptr) {
+        break;
+    }
+    uint64_t map_start = mappings[i]->start/PAGE_SIZE;
+    uint64_t map_pages = (mappings[i]->length + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t map_end = map_start + map_pages;
+
+    if (allocated_page_address + allocate_page_length <= map_start) {
+        ind = i;
+        break;
+    }
+    allocated_page_address = map_end;
+  }
+
+  Mapping* to_add = new Mapping{allocated_page_address << LOG_PAGE_SIZE, length, file, offset};
+
+  insert_mapping(ind, to_add);
+
+  uint64_t page_count = (length/4096);
+  if (length & 0xFFF) {
+    page_count += 1;
+  }
+
+  vmm_lock.unlock();
+
+  
+
+  for (uint64_t i = 0; i < page_count; i++) {
+
+
+
+    VA va = VA((allocated_page_address +i)<< LOG_PAGE_SIZE);
+    VPN vpn = VPN(va);
+
+    PPN ppn = physMem.alloc();
+
+    VA frame_va(ppn);
+    char *buffer = (char *) frame_va;
+
+    
+    for (uint64_t j = 0; j < PAGE_SIZE; j++) {
+        buffer[j] = 0;
+    }
+    if (file != StrongRef<Node>{}) {
+        uint64_t n = co_await file->BlockIO::read(offset, length, buffer);
+        ASSERT(n == length);
+    }
+
+    vmm_lock.lock();
+
+    impl::map(vpn, ppn, false, true);
+
+    vmm_lock.unlock();
+
+  }
+  
+
+
+  co_return (void*)(allocated_page_address << LOG_PAGE_SIZE);
 }
+
+
+
+
 
 sync<int> VMM::munmap(void *addr, std::size_t length) { 
     //MISSING(); 
+
+    uintptr_t unmap_start = reinterpret_cast<uintptr_t>(addr);
+    uint64_t pages_to_unmap = length / 4096;
+    if (length & 0xFFF) {
+        pages_to_unmap += 1;
+    }
+    uint64_t unmap_end = unmap_start + pages_to_unmap * PAGE_SIZE;
+    
+    vmm_lock.lock();
+    uint64_t mapped_index = 0;
+    bool found = false;
+    for (uint64_t i = 0; i < (mappings_size); i++) {
+        uint64_t map_start = mappings[i]->start;
+        uint64_t map_end = map_start + mappings[i]->length;
+        if (map_start < unmap_end && unmap_start < map_end) {
+            mapped_index = i;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        vmm_lock.unlock();
+        co_return 0;
+    }
+    /*for (uint64_t i = (1 << 12) - 1; i > mapped_index; i--) {
+        mappings[i] = mappings[i - 1];
+    }*/
+    for (uint64_t i = 0; i < pages_to_unmap; i++) {
+        VA va = VA(unmap_start + i * PAGE_SIZE);
+        VPN vpn = VPN(va);
+
+        int64_t ippn = unmap(vpn);
+
+        if (ippn != -1) {
+
+            PPN ppn = PPN((uint64_t) ippn);
+            physMem.PhysMem::free(ppn);
+
+        }
+    }
+    uint64_t ind = mapped_index;
+    while (ind < mappings_size) {
+        Mapping* m = mappings[ind];
+
+        uint64_t map_start = m->start;
+        uint64_t map_end   = map_start + m->length;
+
+        if (map_start >= unmap_end)
+            break;
+
+        if (map_end <= unmap_start) {
+            ind += 1;
+            continue;
+        }
+
+        if (unmap_start <= map_start && unmap_end >= map_end) {
+            remove_mapping(ind);
+            continue;
+        }
+
+        if (unmap_start <= map_start && unmap_end < map_end) {
+            m->start = unmap_end;
+            m->length = map_end - unmap_end;
+            m->offset = m->offset + unmap_end - map_start;
+            ind += 1;
+            continue;
+        }
+
+        if (unmap_start > map_start && unmap_end >= map_end) {
+            m->length = unmap_start - map_start;
+            ind += 1;
+            continue;
+        }
+
+        if (unmap_start > map_start && unmap_end < map_end) {
+            uint64_t old_start  = m->start;
+            uint64_t old_end    = m->start + m->length;
+            uint64_t old_offset = m->offset;
+
+            m->length = unmap_start - map_start;
+
+            Mapping *new_map = new Mapping{unmap_end, old_end - unmap_end, m->file, old_offset + unmap_end - old_start};
+            insert_mapping(ind + 1, new_map);
+            break;
+        }
+    }
+    ASSERT(mapped_index >= 0);
+    vmm_lock.unlock();
     co_return 0;
 }
 
@@ -182,3 +341,62 @@ void impl::map(VPN vpn, PPN ppn, bool user, bool write) {
 
 }
 
+
+uint64_t* get_exist_table(uint64_t &entry) {
+    if (!(entry & 1)) {
+        return nullptr;
+    }
+
+
+    PA next_pa{entry & 0x000FFFFFFFFFF000ULL};
+
+    VA next_va{next_pa};
+
+    return (uint64_t *)next_va.va();
+}
+
+int64_t unmap (VPN vpn) {
+    uint64_t va = vpn.vpn() << 12;
+
+    uint64_t pml4_i = (va >> 39) & 0x1FF;
+    uint64_t pdpt_i = (va >> 30) & 0x1FF;
+    uint64_t pd_i   = (va >> 21) & 0x1FF;
+    uint64_t pt_i   = (va >> 12) & 0x1FF;
+
+    uint64_t cr3 = get_cr3();
+
+    PA pml4_pa = PA(cr3 & 0x000FFFFFFFFFF000ULL);
+    VA pml4_va = VA(pml4_pa);
+    uint64_t *pml4 = (uint64_t*)pml4_va.va();
+
+    if (pml4 == nullptr) {
+        return -1;
+    }
+
+    uint64_t *pdpt = get_exist_table(pml4[pml4_i]);
+
+    if (pdpt == nullptr) {
+        return -1;
+    }
+
+    uint64_t* pd = get_exist_table(pdpt[pdpt_i]);
+
+    if (pd == nullptr) {
+        return -1;
+    }
+
+    uint64_t *pt = get_exist_table(pd[pd_i]);
+
+    if (pt == nullptr) {
+        return -1;
+    }
+    if (!(pt[pt_i] & 1)) {
+        return -1;
+    }    
+
+    int64_t to_return = ((pt[pt_i] & 0x000FFFFFFFFFF000ULL) >> 12);
+
+    pt[pt_i] = 0;
+
+    return to_return;
+}
