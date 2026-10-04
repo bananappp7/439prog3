@@ -127,14 +127,18 @@ sync<void*> VMM::simplified_mmap(std::size_t length, StrongRef<Node> file,
     allocated_page_address = map_end;
   }
 
-  Mapping* to_add = new Mapping{allocated_page_address << LOG_PAGE_SIZE, length, file, offset};
-
-  insert_mapping(ind, to_add);
-
   uint64_t page_count = (length/4096);
   if (length & 0xFFF) {
     page_count += 1;
   }
+
+  uint64_t mapped_length = page_count * PAGE_SIZE;
+
+  Mapping* to_add = new Mapping{allocated_page_address << LOG_PAGE_SIZE, mapped_length, file, offset};
+
+  insert_mapping(ind, to_add);
+
+  
 
   vmm_lock.unlock();
 
@@ -193,7 +197,8 @@ sync<int> VMM::munmap(void *addr, std::size_t length) {
     bool found = false;
     for (uint64_t i = 0; i < (mappings_size); i++) {
         uint64_t map_start = mappings[i]->start;
-        uint64_t map_end = map_start + mappings[i]->length;
+        uint64_t map_pages = (mappings[i]->length + PAGE_SIZE - 1) / PAGE_SIZE;
+        uint64_t map_end = map_start + map_pages * PAGE_SIZE;
         if (map_start < unmap_end && unmap_start < map_end) {
             mapped_index = i;
             found = true;
@@ -225,7 +230,8 @@ sync<int> VMM::munmap(void *addr, std::size_t length) {
         Mapping* m = mappings[ind];
 
         uint64_t map_start = m->start;
-        uint64_t map_end   = map_start + m->length;
+        uint64_t map_pages = (m->length + PAGE_SIZE - 1) / PAGE_SIZE;
+        uint64_t map_end = map_start + map_pages * PAGE_SIZE;
 
         if (map_start >= unmap_end)
             break;
@@ -397,6 +403,8 @@ int64_t unmap (VPN vpn) {
     int64_t to_return = ((pt[pt_i] & 0x000FFFFFFFFFF000ULL) >> 12);
 
     pt[pt_i] = 0;
+
+    asm volatile("invlpg (%0)":: "r"(va): "memory");
 
     return to_return;
 }
