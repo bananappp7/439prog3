@@ -101,6 +101,13 @@ sync<void*> VMM::simplified_mmap(std::size_t length, StrongRef<Node> file,
                            uint64_t offset) {
   //MISSING();
 
+  if (length == 0) {
+    co_return reinterpret_cast<void*>(UINTPTR_MAX);
+  }
+  if (file == StrongRef<Node>{} && offset != 0) {
+    co_return reinterpret_cast<void*>(UINTPTR_MAX);
+  }
+ 
   vmm_lock.lock();
 
   uint64_t allocated_page_address = STARTING_ADDRESS;
@@ -160,7 +167,7 @@ sync<void*> VMM::simplified_mmap(std::size_t length, StrongRef<Node> file,
     for (uint64_t j = 0; j < PAGE_SIZE; j++) {
         buffer[j] = 0;
     }
-    if (file != StrongRef<Node>{}) {
+    if (file     != StrongRef<Node>{}) {
         uint64_t n = co_await file->BlockIO::read(offset, length, buffer);
         ASSERT(n == length);
     }
