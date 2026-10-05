@@ -107,6 +107,9 @@ sync<void*> VMM::simplified_mmap(std::size_t length, StrongRef<Node> file,
   if (file == StrongRef<Node>{} && offset != 0) {
     co_return reinterpret_cast<void*>(UINTPTR_MAX);
   }
+  if (offset & 0xFFF) {
+    co_return reinterpret_cast<void*>(UINTPTR_MAX);
+  }
  
   vmm_lock.lock();
 
