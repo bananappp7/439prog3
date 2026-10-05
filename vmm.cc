@@ -168,8 +168,24 @@ sync<void*> VMM::simplified_mmap(std::size_t length, StrongRef<Node> file,
         buffer[j] = 0;
     }
     if (file     != StrongRef<Node>{}) {
-        uint64_t n = co_await file->BlockIO::read(offset, length, buffer);
-        ASSERT(n == length);
+        uint64_t bytes_done = i * PAGE_SIZE;
+
+        uint64_t bytes_left = length - bytes_done;
+
+        uint64_t bytes_to_read = bytes_left < PAGE_SIZE? bytes_left : PAGE_SIZE;
+
+        uint64_t total_read = 0;
+
+        while (total_read < bytes_to_read) {
+
+            uint64_t n = co_await file->BlockIO::read(offset + bytes_done + total_read, bytes_to_read - total_read, buffer + total_read);
+            if (n == 0) {
+                break;
+            }
+
+            total_read += n;
+
+        }
     }
 
     vmm_lock.lock();
