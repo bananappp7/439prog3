@@ -28,6 +28,7 @@ constexpr static uint64_t PAGE_SIZE = 1 << LOG_PAGE_SIZE;
 constexpr static uint64_t STARTING_ADDRESS = 0x00000001;
 
 SpinLock vmm_lock{};
+SpinLock tlb_lock{};
 
 namespace impl {
 
@@ -243,7 +244,9 @@ sync<int> VMM::munmap(void *addr, std::size_t length) {
         VA va = VA(unmap_start + i * PAGE_SIZE);
         VPN vpn = VPN(va);
 
+        tlb_lock.lock();
         int64_t ippn = unmap(vpn);
+        tlb_lock.unlock();
 
         if (ippn != -1) {
 
@@ -499,12 +502,14 @@ int64_t unmap (VPN vpn) {
 
     asm volatile("invlpg (%0)":: "r"(va): "memory");
 
+    vmm_lock.lock();
     impl::tlb_polling.va = va;
     impl::tlb_polling.ack.set(Sys::core_count - 1);
     impl::tlb_polling.generation.add_fetch(1);
     while (impl::tlb_polling.ack.get() > 0) {
         asm volatile("pause");
     }
+    vmm_lock.unlock();
 
     return to_return;
 }
