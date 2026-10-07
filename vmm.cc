@@ -245,7 +245,7 @@ sync<int> VMM::munmap(void *addr, std::size_t length) {
 
         vmm_lock.lock();
         int64_t ippn = unmap(vpn);
-        vmm_lock.inlock();
+        vmm_lock.unlock();
 
         if (ippn != -1) {
 
