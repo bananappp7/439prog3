@@ -20,6 +20,7 @@
 #include "print.h"
 #include "shared.h"
 #include "system_main.h"
+#include "handle_queue.h"
 #include <cstdint>
 
 constexpr static uint64_t LOG_PAGE_SIZE = 12;
@@ -76,7 +77,7 @@ uint64_t VA::check_canonical(uint64_t va) {
 
 void remove_mapping(uint64_t index) {
     delete mappings[index];
-    for (uint64_t i = index; i < mappings_size; i ++) {
+    for (uint64_t i = index; i + 1 < mappings_size; i ++) {
         mappings[i] = mappings[i + 1];
     }
     mappings_size -= 1;
@@ -154,7 +155,7 @@ sync<void*> VMM::simplified_mmap(std::size_t length, StrongRef<Node> file,
 
   
 
-  for (uint64_t i = 0; i < page_count; i++) {
+  /*for (uint64_t i = 0; i < page_count; i++) {
 
 
 
@@ -175,7 +176,7 @@ sync<void*> VMM::simplified_mmap(std::size_t length, StrongRef<Node> file,
 
         uint64_t bytes_left = length - bytes_done;
 
-        uint64_t bytes_to_read = bytes_left < PAGE_SIZE? bytes_left : PAGE_SIZE;
+        uint64_t bytes_to_read = (bytes_left < PAGE_SIZE && 0)? bytes_left : PAGE_SIZE;
 
         uint64_t total_read = 0;
 
@@ -197,7 +198,7 @@ sync<void*> VMM::simplified_mmap(std::size_t length, StrongRef<Node> file,
 
     vmm_lock.unlock();
 
-  }
+  }*/
   
 
 
@@ -303,6 +304,8 @@ sync<int> VMM::munmap(void *addr, std::size_t length) {
     co_return 0;
 }
 
+bool is_mapped(VPN vpn);
+
 extern "C" [[gnu::force_align_arg_pointer]] void
 pageFaultHandler(uintptr_t cr2, impl::PageFaultTrapFrame *trap_frame) {
   using namespace impl;
@@ -310,6 +313,69 @@ pageFaultHandler(uintptr_t cr2, impl::PageFaultTrapFrame *trap_frame) {
   KPRINT("page fault cr2=?, pc=? error_code=?\n", cr2, trap_frame->rip,
          trap_frame->error_code);
 
+  uint64_t fault_address = cr2;
+  uint64_t fault_page = fault_address & ~0xFFF;
+
+  bool present = trap_frame->error_code & 1;
+
+  if (!present) {
+    for (uint64_t i = 0; i < mappings_size; i ++) {
+        if (mappings[i]->start <= fault_address && mappings[i]->start + mappings[i]->length > fault_address) {
+            VA va = VA(fault_page);
+            VPN vpn = VPN(va);
+            PPN ppn = physMem.alloc();
+
+            VA frame_va(ppn);
+            char *buffer = (char *) frame_va;
+
+            
+            for (uint64_t j = 0; j < PAGE_SIZE; j++) {
+                buffer[j] = 0;
+            }
+
+            if (mappings[i]->file != StrongRef<Node>{}) {
+                uint64_t page_offset = (fault_page - mappings[i]->start);
+                uint64_t bytes_to_read = PAGE_SIZE;
+
+                uint64_t total_read = 0;
+
+                while (total_read < bytes_to_read) {
+
+                    auto n = mappings[i]->file->BlockIO::read(page_offset + mappings[i]->offset + total_read, bytes_to_read - total_read, buffer + total_read);
+                    
+                    while (!n.promise->done) {
+                        auto h = impl::ready_queue.remove();
+
+                        if (h) {
+                            h.resume();
+                        } else {
+                            asm volatile("pause");
+                        }
+                    }
+                    if (n.promise->value == 0) {
+                        break;
+                    }
+
+                    total_read += (n.promise->value >= 0) ? n.promise->value : 0;
+
+                }
+            }
+            vmm_lock.lock();
+
+            if (is_mapped(vpn)) {
+                vmm_lock.unlock();
+                physMem.PhysMem::free(ppn);
+                return;
+            }
+
+            impl::map(vpn, ppn, false, true);
+
+            vmm_lock.unlock();
+            return;
+        }
+    }
+  }
+  return;
   //MISSING(); 
   
 }
@@ -387,6 +453,7 @@ uint64_t* get_exist_table(uint64_t &entry) {
     return (uint64_t *)next_va.va();
 }
 
+
 int64_t unmap (VPN vpn) {
     uint64_t va = vpn.vpn() << 12;
 
@@ -432,5 +499,52 @@ int64_t unmap (VPN vpn) {
 
     asm volatile("invlpg (%0)":: "r"(va): "memory");
 
+    impl::tlb_polling.va = va;
+    impl::tlb_polling.ack.set(Sys::core_count - 1);
+    impl::tlb_polling.generation.add_fetch(1);
+    while (impl::tlb_polling.ack.get() > 0) {
+        asm volatile("pause");
+    }
+
     return to_return;
+}
+
+bool is_mapped(VPN vpn) {
+    uint64_t va = vpn.vpn() << 12;
+
+    uint64_t pml4_i = (va >> 39) & 0x1FF;
+    uint64_t pdpt_i = (va >> 30) & 0x1FF;
+    uint64_t pd_i   = (va >> 21) & 0x1FF;
+    uint64_t pt_i   = (va >> 12) & 0x1FF;
+
+    uint64_t cr3 = get_cr3();
+
+    PA pml4_pa = PA(cr3 & 0x000FFFFFFFFFF000ULL);
+    VA pml4_va = VA(pml4_pa);
+    uint64_t *pml4 = (uint64_t*)pml4_va.va();
+
+    if (!(pml4[pml4_i] & 1)) {
+        return false;
+    }
+
+    uint64_t *pdpt = get_exist_table(pml4[pml4_i]);
+
+    if (!(pdpt[pdpt_i] & 1)) {
+        return false;
+    }
+
+     uint64_t* pd = get_exist_table(pdpt[pdpt_i]);
+
+    if (!(pd[pd_i])) {
+        return false;
+    }
+
+    uint64_t *pt = get_exist_table(pd[pd_i]);
+
+    
+    if (!(pt[pt_i] & 1)) {
+        return false;
+    }    
+    return true;
+
 }
