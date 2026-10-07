@@ -111,6 +111,9 @@ sync<void*> VMM::simplified_mmap(std::size_t length, StrongRef<Node> file,
   if (offset & 0xFFF) {
     co_return reinterpret_cast<void*>(UINTPTR_MAX);
   }
+  if (length >= 0x00007FFFFFFFF001) {
+    co_return reinterpret_cast<void*>(UINTPTR_MAX);
+  }
  
   vmm_lock.lock();
 
@@ -217,6 +220,16 @@ sync<int> VMM::munmap(void *addr, std::size_t length) {
     if (length & 0xFFF) {
         pages_to_unmap += 1;
     }
+
+    if (length == 0) {
+        co_return -1;
+    }
+    if (unmap_start & 0xFFF) {
+        co_return -1;
+    }
+    if (unmap_start >= 0x7FFFFFFFFFFF) {
+        co_return -1;
+    }
     uint64_t unmap_end = unmap_start + pages_to_unmap * PAGE_SIZE;
     
     vmm_lock.lock();
@@ -310,8 +323,8 @@ extern "C" [[gnu::force_align_arg_pointer]] void
 pageFaultHandler(uintptr_t cr2, impl::PageFaultTrapFrame *trap_frame) {
   using namespace impl;
 
-  KPRINT("page fault cr2=?, pc=? error_code=?\n", cr2, trap_frame->rip,
-         trap_frame->error_code);
+  /*KPRINT("page fault cr2=?, pc=? error_code=?\n", cr2, trap_frame->rip,
+         trap_frame->error_code);*/
 
   uint64_t fault_address = cr2;
   uint64_t fault_page = fault_address & ~0xFFF;
@@ -344,13 +357,15 @@ pageFaultHandler(uintptr_t cr2, impl::PageFaultTrapFrame *trap_frame) {
                     auto n = mappings[i]->file->BlockIO::read(page_offset + mappings[i]->offset + total_read, bytes_to_read - total_read, buffer + total_read);
                     
                     while (!n.promise->done) {
-                        auto h = impl::ready_queue.remove();
+                        asm volatile("invlpg (%0)" :: "r"(tlb_polling.va) : "memory");
+                        /*auto h = impl::ready_queue.remove();
 
                         if (h) {
                             h.resume();
                         } else {
                             asm volatile("pause");
-                        }
+                        }*/
+                        asm volatile("pause");
                     }
                     if (n.promise->value == 0) {
                         break;
@@ -499,14 +514,12 @@ int64_t unmap (VPN vpn) {
 
     asm volatile("invlpg (%0)":: "r"(va): "memory");
 
-    vmm_lock.lock();
     impl::tlb_polling.va = va;
     impl::tlb_polling.ack.set(Sys::core_count - 1);
     impl::tlb_polling.generation.add_fetch(1);
     while (impl::tlb_polling.ack.get() > 0) {
         asm volatile("pause");
     }
-    vmm_lock.unlock();
 
     return to_return;
 }
