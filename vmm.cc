@@ -499,14 +499,12 @@ int64_t unmap (VPN vpn) {
 
     asm volatile("invlpg (%0)":: "r"(va): "memory");
 
-    vmm_lock.lock();
     impl::tlb_polling.va = va;
     impl::tlb_polling.ack.set(Sys::core_count - 1);
     impl::tlb_polling.generation.add_fetch(1);
     while (impl::tlb_polling.ack.get() > 0) {
         asm volatile("pause");
     }
-    vmm_lock.unlock();
 
     return to_return;
 }
