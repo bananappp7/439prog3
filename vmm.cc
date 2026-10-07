@@ -243,7 +243,9 @@ sync<int> VMM::munmap(void *addr, std::size_t length) {
         VA va = VA(unmap_start + i * PAGE_SIZE);
         VPN vpn = VPN(va);
 
+        vmm_lock.lock();
         int64_t ippn = unmap(vpn);
+        vmm_lock.inlock();
 
         if (ippn != -1) {
 
