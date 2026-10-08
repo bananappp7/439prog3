@@ -252,7 +252,7 @@ sync<int> VMM::munmap(void *addr, std::size_t length) {
     /*for (uint64_t i = (1 << 12) - 1; i > mapped_index; i--) {
         mappings[i] = mappings[i - 1];
     }*/
-    for (uint64_t i = 0; i < pages_to_unmap; i++) {
+    /*for (uint64_t i = 0; i < pages_to_unmap; i++) {
         VA va = VA(unmap_start + i * PAGE_SIZE);
         VPN vpn = VPN(va);
 
@@ -263,6 +263,23 @@ sync<int> VMM::munmap(void *addr, std::size_t length) {
             PPN ppn = PPN((uint64_t) ippn);
             physMem.PhysMem::free(ppn);
 
+        }
+    }*/
+    for (uint64_t i = 0; i < mappings_size; i++) {
+        Mapping* m = mappings[i];
+        uint64_t map_start = m->start;
+        uint64_t map_end = m->start + m->length;
+
+        uint64_t overlap_start = (unmap_start > map_start) ? unmap_start : map_start;
+
+        uint64_t overlap_end = (unmap_end < map_end) ? unmap_end : map_end;
+
+        for (uint64_t va = overlap_start; va < overlap_end; va += PAGE_SIZE) {
+            int64_t ippn = unmap(VPN(VA(va)));
+
+            if (ippn != -1) {
+                physMem.free(PPN((uint64_t)ippn));
+            }
         }
     }
     uint64_t ind = mapped_index;
@@ -356,16 +373,20 @@ pageFaultHandler(uintptr_t cr2, impl::PageFaultTrapFrame *trap_frame) {
 
                     auto n = mappings[i]->file->BlockIO::read(page_offset + mappings[i]->offset + total_read, bytes_to_read - total_read, buffer + total_read);
                     
+
                     while (!n.promise->done) {
                         asm volatile("invlpg (%0)" :: "r"(tlb_polling.va) : "memory");
-                        /*auto h = impl::ready_queue.remove();
+                        impl::tlb_poll();
+
+                        
+                        auto h = impl::ready_queue.remove();
 
                         if (h) {
                             h.resume();
                         } else {
                             asm volatile("pause");
-                        }*/
-                        asm volatile("pause");
+                        }
+                        //asm volatile("pause");
                     }
                     if (n.promise->value == 0) {
                         break;
@@ -517,9 +538,12 @@ int64_t unmap (VPN vpn) {
     impl::tlb_polling.va = va;
     impl::tlb_polling.ack.set(Sys::core_count - 1);
     impl::tlb_polling.generation.add_fetch(1);
+    //KPRINT("wait");
     while (impl::tlb_polling.ack.get() > 0) {
         asm volatile("pause");
     }
+
+    //KPRINT("ack done");
 
     return to_return;
 }
