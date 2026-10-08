@@ -15,6 +15,7 @@
 
 #include "debug.h"
 #include "spin_lock.h"
+#include "machine.h"
 #include <coroutine>
 #include <cstdint>
 
@@ -200,5 +201,7 @@ struct Polling {
     Atomic<uint64_t> ack;
 };
 extern Polling tlb_polling;
-void tlb_poll(uint64_t& core_gen);
+void tlb_poll();
+uint64_t get_last_generation();
+void set_last_generation(uint64_t last_gen);
 } // namespace impl
