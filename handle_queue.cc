@@ -25,22 +25,31 @@ Atomic<uint64_t> finished = 0;
 
 Polling tlb_polling{};
 
-void tlb_poll(uint64_t & core_gen) {
-    if (core_gen < tlb_polling.generation.get()) {
-        core_gen = tlb_polling.generation.get();
-        asm volatile("invlpg (%0)":: "r"(tlb_polling.va): "memory");
-        tlb_polling.ack.sub_fetch(1);
-    }
+void tlb_poll() {
+  uint64_t last_gen = tlb_polling.generation.get();
+  if (get_last_generation() < last_gen) {
+    uint64_t va = tlb_polling.va;
+    asm volatile("invlpg (%0)":: "r"(va): "memory");
+    set_last_generation(last_gen);
+    tlb_polling.ack.sub_fetch(1);
+  }
+}
+
+void set_last_generation(uint64_t gen) {
+  wrgsbase(gen);
+}
+
+uint64_t get_last_generation() {
+  return rdgsbase();
 }
 
 [[noreturn]]
 void event_loop(bool shutdown_when_done) {
 
-  uint64_t core_generation = 0;
   while ((started == 0) || (finished != started)) {
-    tlb_poll(core_generation);
+    tlb_poll();
     auto handle = impl::ready_queue.remove();
-    tlb_poll(core_generation);
+    tlb_poll();
     if (handle) {
       handle.resume();
     } else {
